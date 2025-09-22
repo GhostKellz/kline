@@ -78,6 +78,12 @@ Kline is a powerful cross-platform rendering engine built in Zig, providing hard
 - Zig 0.16.0 or later
 - Platform-specific graphics libraries (optional for software rendering)
 
+### Adding to Zig Project
+```bash
+# Add Kline to your Zig project
+zig fetch --save https://github.com/ghostkellz/kline/archive/refs/heads/main.tar.gz
+```
+
 ### Building
 ```bash
 # Build the library
