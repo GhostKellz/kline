@@ -16,10 +16,18 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
+    // Optional backend compilation flags for reduced binary size
+    const enable_vulkan = b.option(bool, "vulkan", "Enable Vulkan backend") orelse true;
+    const enable_dx12 = b.option(bool, "dx12", "Enable DirectX 12 backend") orelse true;
+    const enable_dx13 = b.option(bool, "dx13", "Enable DirectX 13 backend") orelse true;
+    const enable_metal = b.option(bool, "metal", "Enable Metal backend") orelse true;
+    const enable_opengl = b.option(bool, "opengl", "Enable OpenGL ES backend") orelse true;
+    const enable_software = b.option(bool, "software", "Enable Software backend") orelse true;
+
+    // Features compilation flags
+    const enable_text_rendering = b.option(bool, "text", "Enable text rendering system") orelse true;
+    const enable_compute_shaders = b.option(bool, "compute", "Enable compute shader support") orelse true;
+    const enable_advanced_memory = b.option(bool, "advanced-memory", "Enable advanced memory management") orelse true;
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -40,6 +48,20 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+
+    // Add compile-time options for conditional compilation
+    const options = b.addOptions();
+    options.addOption(bool, "enable_vulkan", enable_vulkan);
+    options.addOption(bool, "enable_dx12", enable_dx12);
+    options.addOption(bool, "enable_dx13", enable_dx13);
+    options.addOption(bool, "enable_metal", enable_metal);
+    options.addOption(bool, "enable_opengl", enable_opengl);
+    options.addOption(bool, "enable_software", enable_software);
+    options.addOption(bool, "enable_text_rendering", enable_text_rendering);
+    options.addOption(bool, "enable_compute_shaders", enable_compute_shaders);
+    options.addOption(bool, "enable_advanced_memory", enable_advanced_memory);
+
+    mod.addImport("build_options", options.createModule());
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -162,6 +184,26 @@ pub fn build(b: *std.Build) void {
     const triangle_run_cmd = b.addRunArtifact(triangle_example);
     triangle_run_step.dependOn(&triangle_run_cmd.step);
     triangle_run_cmd.step.dependOn(b.getInstallStep());
+
+    // Comprehensive P1-P2 demo
+    const comprehensive_demo = b.addExecutable(.{
+        .name = "comprehensive_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/comprehensive_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "kline", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(comprehensive_demo);
+
+    const demo_run_step = b.step("demo", "Run the comprehensive P1-P2 demo");
+    const demo_run_cmd = b.addRunArtifact(comprehensive_demo);
+    demo_run_step.dependOn(&demo_run_cmd.step);
+    demo_run_cmd.step.dependOn(b.getInstallStep());
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

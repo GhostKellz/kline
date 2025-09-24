@@ -2,18 +2,32 @@
 //! Hardware-accelerated 3D/2D rendering with multiple backends
 //! Supports Vulkan, DirectX 12/13, Metal, OpenGL ES, and software rendering
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const renderer = @import("renderer.zig");
 pub const vector = @import("vector.zig");
 pub const memory_pool = @import("memory_pool.zig");
 pub const compute = @import("compute.zig");
 
+// P2 Features - Conditional compilation based on build flags
+pub const text = if (build_options.enable_text_rendering) @import("text.zig") else struct {};
+pub const shader = @import("shader.zig");
+pub const threading = @import("threading.zig");
+
+// Core types
 pub const Backend = renderer.Backend;
 pub const Renderer = renderer.Renderer;
 pub const VectorContext = vector.VectorContext;
 pub const MemoryPool = memory_pool.MemoryPool;
 pub const GPUMemoryPool = memory_pool.GPUMemoryPool;
 pub const ParallelFor = compute.ParallelFor;
+
+// P2 types
+pub const Font = if (build_options.enable_text_rendering) text.Font else void;
+pub const TextRenderer = if (build_options.enable_text_rendering) text.TextRenderer else void;
+pub const ShaderManager = shader.ShaderManager;
+pub const JobSystem = threading.JobSystem;
+pub const ParallelRenderSystem = threading.ParallelRenderSystem;
 
 pub fn createRenderer(allocator: std.mem.Allocator, backend: Backend) !*Renderer {
     return renderer.create(allocator, backend);

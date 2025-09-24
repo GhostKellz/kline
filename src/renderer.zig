@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 pub const Backend = enum {
     vulkan,
@@ -343,11 +345,29 @@ pub const IndexFormat = enum {
 
 pub fn create(allocator: std.mem.Allocator, backend: Backend) !*Renderer {
     return switch (backend) {
-        .vulkan => error.VulkanNotAvailable,
-        .directx12 => error.DirectX12NotAvailable,
-        .directx13 => @import("dx13/dx13.zig").create(allocator),
-        .metal => error.MetalNotAvailable,
-        .opengl_es => error.OpenGLESNotAvailable,
-        .software => @import("software/software.zig").create(allocator),
+        .vulkan => if (build_options.enable_vulkan)
+            @import("vulkan/vulkan.zig").create(allocator)
+        else
+            error.VulkanNotAvailable,
+        .directx12 => if (build_options.enable_dx12)
+            @import("dx12/dx12.zig").create(allocator)
+        else
+            error.DirectX12NotAvailable,
+        .directx13 => if (build_options.enable_dx13)
+            @import("dx13/dx13.zig").create(allocator)
+        else
+            error.DirectX13NotAvailable,
+        .metal => if (build_options.enable_metal)
+            error.MetalNotAvailable // TODO: Implement when ready
+        else
+            error.MetalNotAvailable,
+        .opengl_es => if (build_options.enable_opengl)
+            error.OpenGLESNotAvailable // TODO: Implement when ready
+        else
+            error.OpenGLESNotAvailable,
+        .software => if (build_options.enable_software)
+            @import("software/software.zig").create(allocator)
+        else
+            error.SoftwareNotAvailable,
     };
 }

@@ -342,28 +342,637 @@ fn deinitImpl(ptr: *anyopaque) void {
     self.deinit();
 }
 
-fn createBufferImpl(ptr: *anyopaque, desc: renderer.BufferDescriptor) anyerror!*renderer.Buffer {
-    _ = ptr;
-    _ = desc;
-    return error.NotImplemented;
+const DX12Buffer = struct {
+    allocator: std.mem.Allocator,
+    resource: *c.ID3D12Resource,
+    size: usize,
+    usage: renderer.BufferUsage,
+    mapped_ptr: ?*anyopaque = null,
+
+    pub fn deinit(self: *DX12Buffer) void {
+        if (self.mapped_ptr) |_| {
+            self.resource.*.lpVtbl.*.Unmap.?(self.resource, 0, null);
+        }
+        _ = self.resource.*.lpVtbl.*.Release.?(self.resource);
+        self.allocator.destroy(self);
+    }
+
+    pub fn map(self: *DX12Buffer) ![]u8 {
+        if (self.mapped_ptr) |ptr| {
+            return @as([*]u8, @ptrCast(ptr))[0..self.size];
+        }
+
+        const hr = self.resource.*.lpVtbl.*.Map.?(self.resource, 0, null, &self.mapped_ptr);
+        if (hr < 0) return error.MappingFailed;
+
+        return @as([*]u8, @ptrCast(self.mapped_ptr.?))[0..self.size];
+    }
+
+    pub fn unmap(self: *DX12Buffer) void {
+        if (self.mapped_ptr) |_| {
+            self.resource.*.lpVtbl.*.Unmap.?(self.resource, 0, null);
+            self.mapped_ptr = null;
+        }
+    }
+
+    pub fn write(self: *DX12Buffer, data: []const u8, offset: usize) void {
+        const mapped_data = self.map() catch return;
+        defer if (self.mapped_ptr == null) self.unmap();
+
+        const write_size = @min(data.len, self.size - offset);
+        @memcpy(mapped_data[offset..offset + write_size], data[0..write_size]);
+    }
+};
+
+fn dx12BufferDeinit(ptr: *anyopaque) void {
+    const buffer = @as(*DX12Buffer, @ptrCast(@alignCast(ptr)));
+    buffer.deinit();
 }
+
+fn dx12BufferMap(ptr: *anyopaque) anyerror![]u8 {
+    const buffer = @as(*DX12Buffer, @ptrCast(@alignCast(ptr)));
+    return buffer.map();
+}
+
+fn dx12BufferUnmap(ptr: *anyopaque) void {
+    const buffer = @as(*DX12Buffer, @ptrCast(@alignCast(ptr)));
+    buffer.unmap();
+}
+
+fn dx12BufferWrite(ptr: *anyopaque, data: []const u8, offset: usize) void {
+    const buffer = @as(*DX12Buffer, @ptrCast(@alignCast(ptr)));
+    buffer.write(data, offset);
+}
+
+const dx12_buffer_vtable = renderer.Buffer.VTable{
+    .deinit = dx12BufferDeinit,
+    .map = dx12BufferMap,
+    .unmap = dx12BufferUnmap,
+    .write = dx12BufferWrite,
+};
+
+fn createBufferImpl(ptr: *anyopaque, desc: renderer.BufferDescriptor) anyerror!*renderer.Buffer {
+    const self = @as(*DX12Renderer, @ptrCast(@alignCast(ptr)));
+
+    const heap_props = c.D3D12_HEAP_PROPERTIES{
+        .Type = c.D3D12_HEAP_TYPE_UPLOAD,
+        .CPUPageProperty = c.D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        .MemoryPoolPreference = c.D3D12_MEMORY_POOL_UNKNOWN,
+        .CreationNodeMask = 1,
+        .VisibleNodeMask = 1,
+    };
+
+    const buffer_desc = c.D3D12_RESOURCE_DESC{
+        .Dimension = c.D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Alignment = 0,
+        .Width = desc.size,
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = c.DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = .{ .Count = 1, .Quality = 0 },
+        .Layout = c.D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        .Flags = c.D3D12_RESOURCE_FLAG_NONE,
+    };
+
+    const dx12_buffer = try self.allocator.create(DX12Buffer);
+    dx12_buffer.* = DX12Buffer{
+        .allocator = self.allocator,
+        .resource = undefined,
+        .size = desc.size,
+        .usage = desc.usage,
+    };
+
+    const hr = self.device.*.lpVtbl.*.CreateCommittedResource.?(
+        self.device,
+        &heap_props,
+        c.D3D12_HEAP_FLAG_NONE,
+        &buffer_desc,
+        c.D3D12_RESOURCE_STATE_GENERIC_READ,
+        null,
+        &c.IID_ID3D12Resource,
+        @ptrCast(&dx12_buffer.resource),
+    );
+
+    if (hr < 0) {
+        self.allocator.destroy(dx12_buffer);
+        return error.BufferCreationFailed;
+    }
+
+    const buffer = try self.allocator.create(renderer.Buffer);
+    buffer.* = renderer.Buffer{
+        .handle = dx12_buffer,
+        .size = desc.size,
+        .usage = desc.usage,
+        .vtable = &dx12_buffer_vtable,
+    };
+
+    return buffer;
+}
+
+const DX12Texture = struct {
+    allocator: std.mem.Allocator,
+    resource: *c.ID3D12Resource,
+    width: u32,
+    height: u32,
+    format: renderer.RenderTargetFormat,
+    device: *c.ID3D12Device,
+
+    pub fn deinit(self: *DX12Texture) void {
+        _ = self.resource.*.lpVtbl.*.Release.?(self.resource);
+        self.allocator.destroy(self);
+    }
+
+    pub fn createView(self: *DX12Texture) !*renderer.TextureView {
+        const dx12_view = try self.allocator.create(DX12TextureView);
+        dx12_view.* = DX12TextureView{
+            .allocator = self.allocator,
+            .resource = self.resource,
+        };
+
+        const view = try self.allocator.create(renderer.TextureView);
+        view.* = renderer.TextureView{
+            .handle = dx12_view,
+            .vtable = &dx12_texture_view_vtable,
+        };
+
+        return view;
+    }
+};
+
+const DX12TextureView = struct {
+    allocator: std.mem.Allocator,
+    resource: *c.ID3D12Resource,
+
+    pub fn deinit(self: *DX12TextureView) void {
+        self.allocator.destroy(self);
+    }
+};
+
+fn dx12TextureDeinit(ptr: *anyopaque) void {
+    const texture = @as(*DX12Texture, @ptrCast(@alignCast(ptr)));
+    texture.deinit();
+}
+
+fn dx12TextureCreateView(ptr: *anyopaque) anyerror!*renderer.TextureView {
+    const texture = @as(*DX12Texture, @ptrCast(@alignCast(ptr)));
+    return texture.createView();
+}
+
+fn dx12TextureViewDeinit(ptr: *anyopaque) void {
+    const view = @as(*DX12TextureView, @ptrCast(@alignCast(ptr)));
+    view.deinit();
+}
+
+const dx12_texture_vtable = renderer.Texture.VTable{
+    .deinit = dx12TextureDeinit,
+    .create_view = dx12TextureCreateView,
+};
+
+const dx12_texture_view_vtable = renderer.TextureView.VTable{
+    .deinit = dx12TextureViewDeinit,
+};
 
 fn createTextureImpl(ptr: *anyopaque, desc: renderer.TextureDescriptor) anyerror!*renderer.Texture {
-    _ = ptr;
-    _ = desc;
-    return error.NotImplemented;
+    const self = @as(*DX12Renderer, @ptrCast(@alignCast(ptr)));
+
+    const dxgi_format = switch (desc.format) {
+        .rgba8 => c.DXGI_FORMAT_R8G8B8A8_UNORM,
+        .rgba16f => c.DXGI_FORMAT_R16G16B16A16_FLOAT,
+        .rgba32f => c.DXGI_FORMAT_R32G32B32A32_FLOAT,
+        .depth24_stencil8 => c.DXGI_FORMAT_D24_UNORM_S8_UINT,
+        .depth32f => c.DXGI_FORMAT_D32_FLOAT,
+    };
+
+    const heap_props = c.D3D12_HEAP_PROPERTIES{
+        .Type = c.D3D12_HEAP_TYPE_DEFAULT,
+        .CPUPageProperty = c.D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        .MemoryPoolPreference = c.D3D12_MEMORY_POOL_UNKNOWN,
+        .CreationNodeMask = 1,
+        .VisibleNodeMask = 1,
+    };
+
+    var resource_flags: c.D3D12_RESOURCE_FLAGS = c.D3D12_RESOURCE_FLAG_NONE;
+    if (desc.usage.render_target) {
+        if (desc.format == .depth24_stencil8 or desc.format == .depth32f) {
+            resource_flags |= c.D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        } else {
+            resource_flags |= c.D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        }
+    }
+    if (desc.usage.storage) {
+        resource_flags |= c.D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
+
+    const texture_desc = c.D3D12_RESOURCE_DESC{
+        .Dimension = c.D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        .Alignment = 0,
+        .Width = desc.width,
+        .Height = desc.height,
+        .DepthOrArraySize = @intCast(desc.depth),
+        .MipLevels = @intCast(desc.mip_levels),
+        .Format = dxgi_format,
+        .SampleDesc = .{ .Count = @intCast(desc.sample_count), .Quality = 0 },
+        .Layout = c.D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        .Flags = resource_flags,
+    };
+
+    const dx12_texture = try self.allocator.create(DX12Texture);
+    dx12_texture.* = DX12Texture{
+        .allocator = self.allocator,
+        .resource = undefined,
+        .width = desc.width,
+        .height = desc.height,
+        .format = desc.format,
+        .device = self.device,
+    };
+
+    const hr = self.device.*.lpVtbl.*.CreateCommittedResource.?(
+        self.device,
+        &heap_props,
+        c.D3D12_HEAP_FLAG_NONE,
+        &texture_desc,
+        c.D3D12_RESOURCE_STATE_COMMON,
+        null,
+        &c.IID_ID3D12Resource,
+        @ptrCast(&dx12_texture.resource),
+    );
+
+    if (hr < 0) {
+        self.allocator.destroy(dx12_texture);
+        return error.TextureCreationFailed;
+    }
+
+    const texture = try self.allocator.create(renderer.Texture);
+    texture.* = renderer.Texture{
+        .handle = dx12_texture,
+        .width = desc.width,
+        .height = desc.height,
+        .format = desc.format,
+        .vtable = &dx12_texture_vtable,
+    };
+
+    return texture;
 }
+
+const DX12Pipeline = struct {
+    allocator: std.mem.Allocator,
+    pipeline_state: *c.ID3D12PipelineState,
+    root_signature: *c.ID3D12RootSignature,
+
+    pub fn deinit(self: *DX12Pipeline) void {
+        _ = self.pipeline_state.*.lpVtbl.*.Release.?(self.pipeline_state);
+        _ = self.root_signature.*.lpVtbl.*.Release.?(self.root_signature);
+        self.allocator.destroy(self);
+    }
+};
+
+fn dx12PipelineDeinit(ptr: *anyopaque) void {
+    const pipeline = @as(*DX12Pipeline, @ptrCast(@alignCast(ptr)));
+    pipeline.deinit();
+}
+
+const dx12_pipeline_vtable = renderer.Pipeline.VTable{
+    .deinit = dx12PipelineDeinit,
+};
 
 fn createPipelineImpl(ptr: *anyopaque, desc: renderer.PipelineDescriptor) anyerror!*renderer.Pipeline {
-    _ = ptr;
-    _ = desc;
-    return error.NotImplemented;
+    const self = @as(*DX12Renderer, @ptrCast(@alignCast(ptr)));
+
+    // Compile shaders
+    var vs_blob: ?*c.ID3DBlob = null;
+    var ps_blob: ?*c.ID3DBlob = null;
+    var error_blob: ?*c.ID3DBlob = null;
+
+    var hr = c.D3DCompile(
+        desc.vertex_shader.ptr,
+        desc.vertex_shader.len,
+        "vertex_shader",
+        null,
+        null,
+        "main",
+        "vs_5_0",
+        0,
+        0,
+        &vs_blob,
+        &error_blob,
+    );
+
+    if (hr < 0) {
+        if (error_blob) |blob| {
+            _ = blob.*.lpVtbl.*.Release.?(blob);
+        }
+        return error.VertexShaderCompilationFailed;
+    }
+    defer if (vs_blob) |blob| _ = blob.*.lpVtbl.*.Release.?(blob);
+
+    hr = c.D3DCompile(
+        desc.fragment_shader.ptr,
+        desc.fragment_shader.len,
+        "pixel_shader",
+        null,
+        null,
+        "main",
+        "ps_5_0",
+        0,
+        0,
+        &ps_blob,
+        &error_blob,
+    );
+
+    if (hr < 0) {
+        if (error_blob) |blob| {
+            _ = blob.*.lpVtbl.*.Release.?(blob);
+        }
+        return error.FragmentShaderCompilationFailed;
+    }
+    defer if (ps_blob) |blob| _ = blob.*.lpVtbl.*.Release.?(blob);
+
+    // Create input layout
+    var input_elements = try self.allocator.alloc(c.D3D12_INPUT_ELEMENT_DESC, desc.vertex_layout.attributes.len);
+    defer self.allocator.free(input_elements);
+
+    for (desc.vertex_layout.attributes, 0..) |attr, i| {
+        const semantic_name = "POSITION";
+        const format = switch (attr.format) {
+            .float32 => c.DXGI_FORMAT_R32_FLOAT,
+            .float32x2 => c.DXGI_FORMAT_R32G32_FLOAT,
+            .float32x3 => c.DXGI_FORMAT_R32G32B32_FLOAT,
+            .float32x4 => c.DXGI_FORMAT_R32G32B32A32_FLOAT,
+            .uint32 => c.DXGI_FORMAT_R32_UINT,
+            .uint32x2 => c.DXGI_FORMAT_R32G32_UINT,
+            .uint32x3 => c.DXGI_FORMAT_R32G32B32_UINT,
+            .uint32x4 => c.DXGI_FORMAT_R32G32B32A32_UINT,
+            .sint32 => c.DXGI_FORMAT_R32_SINT,
+            .sint32x2 => c.DXGI_FORMAT_R32G32_SINT,
+            .sint32x3 => c.DXGI_FORMAT_R32G32B32_SINT,
+            .sint32x4 => c.DXGI_FORMAT_R32G32B32A32_SINT,
+        };
+
+        input_elements[i] = c.D3D12_INPUT_ELEMENT_DESC{
+            .SemanticName = semantic_name,
+            .SemanticIndex = 0,
+            .Format = format,
+            .InputSlot = 0,
+            .AlignedByteOffset = attr.offset,
+            .InputSlotClass = c.D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0,
+        };
+    }
+
+    const dx12_pipeline = try self.allocator.create(DX12Pipeline);
+    dx12_pipeline.* = DX12Pipeline{
+        .allocator = self.allocator,
+        .pipeline_state = undefined,
+        .root_signature = self.root_signature,
+    };
+
+    // Create graphics pipeline state
+    const pso_desc = c.D3D12_GRAPHICS_PIPELINE_STATE_DESC{
+        .pRootSignature = self.root_signature,
+        .VS = .{
+            .pShaderBytecode = vs_blob.?.*.lpVtbl.*.GetBufferPointer.?(vs_blob.?),
+            .BytecodeLength = vs_blob.?.*.lpVtbl.*.GetBufferSize.?(vs_blob.?),
+        },
+        .PS = .{
+            .pShaderBytecode = ps_blob.?.*.lpVtbl.*.GetBufferPointer.?(ps_blob.?),
+            .BytecodeLength = ps_blob.?.*.lpVtbl.*.GetBufferSize.?(ps_blob.?),
+        },
+        .DS = .{ .pShaderBytecode = null, .BytecodeLength = 0 },
+        .HS = .{ .pShaderBytecode = null, .BytecodeLength = 0 },
+        .GS = .{ .pShaderBytecode = null, .BytecodeLength = 0 },
+        .StreamOutput = std.mem.zeroes(c.D3D12_STREAM_OUTPUT_DESC),
+        .BlendState = c.D3D12_BLEND_DESC{
+            .AlphaToCoverageEnable = 0,
+            .IndependentBlendEnable = 0,
+            .RenderTarget = [_]c.D3D12_RENDER_TARGET_BLEND_DESC{
+                c.D3D12_RENDER_TARGET_BLEND_DESC{
+                    .BlendEnable = if (desc.blend_enabled) 1 else 0,
+                    .LogicOpEnable = 0,
+                    .SrcBlend = c.D3D12_BLEND_ONE,
+                    .DestBlend = c.D3D12_BLEND_ZERO,
+                    .BlendOp = c.D3D12_BLEND_OP_ADD,
+                    .SrcBlendAlpha = c.D3D12_BLEND_ONE,
+                    .DestBlendAlpha = c.D3D12_BLEND_ZERO,
+                    .BlendOpAlpha = c.D3D12_BLEND_OP_ADD,
+                    .LogicOp = c.D3D12_LOGIC_OP_NOOP,
+                    .RenderTargetWriteMask = c.D3D12_COLOR_WRITE_ENABLE_ALL,
+                },
+            } ++ [_]c.D3D12_RENDER_TARGET_BLEND_DESC{std.mem.zeroes(c.D3D12_RENDER_TARGET_BLEND_DESC)} ** 7,
+        },
+        .SampleMask = 0xffffffff,
+        .RasterizerState = c.D3D12_RASTERIZER_DESC{
+            .FillMode = c.D3D12_FILL_MODE_SOLID,
+            .CullMode = switch (desc.cull_mode) {
+                .none => c.D3D12_CULL_MODE_NONE,
+                .front => c.D3D12_CULL_MODE_FRONT,
+                .back => c.D3D12_CULL_MODE_BACK,
+            },
+            .FrontCounterClockwise = switch (desc.front_face) {
+                .counter_clockwise => 1,
+                .clockwise => 0,
+            },
+            .DepthBias = 0,
+            .DepthBiasClamp = 0.0,
+            .SlopeScaledDepthBias = 0.0,
+            .DepthClipEnable = 1,
+            .MultisampleEnable = 0,
+            .AntialiasedLineEnable = 0,
+            .ForcedSampleCount = 0,
+            .ConservativeRaster = c.D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+        },
+        .DepthStencilState = c.D3D12_DEPTH_STENCIL_DESC{
+            .DepthEnable = if (desc.depth_test) 1 else 0,
+            .DepthWriteMask = if (desc.depth_write) c.D3D12_DEPTH_WRITE_MASK_ALL else c.D3D12_DEPTH_WRITE_MASK_ZERO,
+            .DepthFunc = c.D3D12_COMPARISON_FUNC_LESS,
+            .StencilEnable = 0,
+            .StencilReadMask = c.D3D12_DEFAULT_STENCIL_READ_MASK,
+            .StencilWriteMask = c.D3D12_DEFAULT_STENCIL_WRITE_MASK,
+            .FrontFace = std.mem.zeroes(c.D3D12_DEPTH_STENCILOP_DESC),
+            .BackFace = std.mem.zeroes(c.D3D12_DEPTH_STENCILOP_DESC),
+        },
+        .InputLayout = c.D3D12_INPUT_LAYOUT_DESC{
+            .pInputElementDescs = input_elements.ptr,
+            .NumElements = @intCast(input_elements.len),
+        },
+        .IBStripCutValue = c.D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+        .PrimitiveTopologyType = switch (desc.primitive_type) {
+            .point_list => c.D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+            .line_list, .line_strip => c.D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+            .triangle_list, .triangle_strip => c.D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        },
+        .NumRenderTargets = 1,
+        .RTVFormats = [_]c.DXGI_FORMAT{c.DXGI_FORMAT_R8G8B8A8_UNORM} ++ [_]c.DXGI_FORMAT{c.DXGI_FORMAT_UNKNOWN} ** 7,
+        .DSVFormat = c.DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = .{ .Count = 1, .Quality = 0 },
+        .NodeMask = 0,
+        .CachedPSO = std.mem.zeroes(c.D3D12_CACHED_PIPELINE_STATE),
+        .Flags = c.D3D12_PIPELINE_STATE_FLAG_NONE,
+    };
+
+    hr = self.device.*.lpVtbl.*.CreateGraphicsPipelineState.?(
+        self.device,
+        &pso_desc,
+        &c.IID_ID3D12PipelineState,
+        @ptrCast(&dx12_pipeline.pipeline_state),
+    );
+
+    if (hr < 0) {
+        self.allocator.destroy(dx12_pipeline);
+        return error.PipelineCreationFailed;
+    }
+
+    const pipeline = try self.allocator.create(renderer.Pipeline);
+    pipeline.* = renderer.Pipeline{
+        .handle = dx12_pipeline,
+        .vtable = &dx12_pipeline_vtable,
+    };
+
+    return pipeline;
 }
 
+const DX12RenderPass = struct {
+    allocator: std.mem.Allocator,
+    command_list: *c.ID3D12GraphicsCommandList,
+    renderer: *DX12Renderer,
+
+    pub fn end(self: *DX12RenderPass) void {
+        _ = self.command_list.*.lpVtbl.*.Close.?(self.command_list);
+
+        var command_lists = [_]*c.ID3D12CommandList{@ptrCast(self.command_list)};
+        self.renderer.command_queue.*.lpVtbl.*.ExecuteCommandLists.?(self.renderer.command_queue, 1, &command_lists);
+
+        _ = self.renderer.swapchain.*.lpVtbl.*.Present.?(self.renderer.swapchain, 1, 0);
+        self.renderer.waitForPreviousFrame();
+
+        self.allocator.destroy(self);
+    }
+
+    pub fn setPipeline(self: *DX12RenderPass, pipeline: *renderer.Pipeline) void {
+        const dx12_pipeline = @as(*DX12Pipeline, @ptrCast(@alignCast(pipeline.handle)));
+        self.command_list.*.lpVtbl.*.SetPipelineState.?(self.command_list, dx12_pipeline.pipeline_state);
+        self.command_list.*.lpVtbl.*.SetGraphicsRootSignature.?(self.command_list, dx12_pipeline.root_signature);
+    }
+
+    pub fn setVertexBuffer(self: *DX12RenderPass, slot: u32, buffer: *renderer.Buffer) void {
+        const dx12_buffer = @as(*DX12Buffer, @ptrCast(@alignCast(buffer.handle)));
+        const vbv = c.D3D12_VERTEX_BUFFER_VIEW{
+            .BufferLocation = dx12_buffer.resource.*.lpVtbl.*.GetGPUVirtualAddress.?(dx12_buffer.resource),
+            .SizeInBytes = @intCast(dx12_buffer.size),
+            .StrideInBytes = 0, // This should be calculated from vertex layout
+        };
+        self.command_list.*.lpVtbl.*.IASetVertexBuffers.?(self.command_list, slot, 1, &vbv);
+    }
+
+    pub fn setIndexBuffer(self: *DX12RenderPass, buffer: *renderer.Buffer, format: renderer.IndexFormat) void {
+        const dx12_buffer = @as(*DX12Buffer, @ptrCast(@alignCast(buffer.handle)));
+        const ibv = c.D3D12_INDEX_BUFFER_VIEW{
+            .BufferLocation = dx12_buffer.resource.*.lpVtbl.*.GetGPUVirtualAddress.?(dx12_buffer.resource),
+            .SizeInBytes = @intCast(dx12_buffer.size),
+            .Format = switch (format) {
+                .uint16 => c.DXGI_FORMAT_R16_UINT,
+                .uint32 => c.DXGI_FORMAT_R32_UINT,
+            },
+        };
+        self.command_list.*.lpVtbl.*.IASetIndexBuffer.?(self.command_list, &ibv);
+    }
+
+    pub fn draw(self: *DX12RenderPass, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
+        self.command_list.*.lpVtbl.*.DrawInstanced.?(self.command_list, vertex_count, instance_count, first_vertex, first_instance);
+    }
+
+    pub fn drawIndexed(self: *DX12RenderPass, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32) void {
+        _ = vertex_offset;
+        self.command_list.*.lpVtbl.*.DrawIndexedInstanced.?(self.command_list, index_count, instance_count, first_index, first_instance);
+    }
+};
+
+fn dx12RenderPassEnd(ptr: *anyopaque) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.end();
+}
+
+fn dx12RenderPassSetPipeline(ptr: *anyopaque, pipeline: *renderer.Pipeline) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.setPipeline(pipeline);
+}
+
+fn dx12RenderPassSetVertexBuffer(ptr: *anyopaque, slot: u32, buffer: *renderer.Buffer) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.setVertexBuffer(slot, buffer);
+}
+
+fn dx12RenderPassSetIndexBuffer(ptr: *anyopaque, buffer: *renderer.Buffer, format: renderer.IndexFormat) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.setIndexBuffer(buffer, format);
+}
+
+fn dx12RenderPassDraw(ptr: *anyopaque, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.draw(vertex_count, instance_count, first_vertex, first_instance);
+}
+
+fn dx12RenderPassDrawIndexed(ptr: *anyopaque, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32) void {
+    const render_pass = @as(*DX12RenderPass, @ptrCast(@alignCast(ptr)));
+    render_pass.drawIndexed(index_count, instance_count, first_index, vertex_offset, first_instance);
+}
+
+const dx12_render_pass_vtable = renderer.RenderPass.VTable{
+    .end = dx12RenderPassEnd,
+    .set_pipeline = dx12RenderPassSetPipeline,
+    .set_vertex_buffer = dx12RenderPassSetVertexBuffer,
+    .set_index_buffer = dx12RenderPassSetIndexBuffer,
+    .draw = dx12RenderPassDraw,
+    .draw_indexed = dx12RenderPassDrawIndexed,
+};
+
 fn beginRenderPassImpl(ptr: *anyopaque, desc: renderer.RenderPassDescriptor) anyerror!*renderer.RenderPass {
-    _ = ptr;
-    _ = desc;
-    return error.NotImplemented;
+    const self = @as(*DX12Renderer, @ptrCast(@alignCast(ptr)));
+
+    _ = self.command_allocator.*.lpVtbl.*.Reset.?(self.command_allocator);
+    _ = self.command_list.*.lpVtbl.*.Reset.?(self.command_list, self.command_allocator, null);
+
+    const barrier = c.D3D12_RESOURCE_BARRIER{
+        .Type = c.D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        .Flags = c.D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        .Transition = .{
+            .pResource = self.render_targets[self.frame_index],
+            .StateBefore = c.D3D12_RESOURCE_STATE_PRESENT,
+            .StateAfter = c.D3D12_RESOURCE_STATE_RENDER_TARGET,
+            .Subresource = c.D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        },
+    };
+
+    self.command_list.*.lpVtbl.*.ResourceBarrier.?(self.command_list, 1, &barrier);
+
+    var rtv_handle = self.descriptor_heap.*.lpVtbl.*.GetCPUDescriptorHandleForHeapStart.?(self.descriptor_heap);
+    rtv_handle.ptr += self.frame_index * self.rtv_descriptor_size;
+
+    self.command_list.*.lpVtbl.*.OMSetRenderTargets.?(self.command_list, 1, &rtv_handle, 0, null);
+
+    var clear_color = [_]f32{ 0.0, 0.2, 0.4, 1.0 };
+    if (desc.color_attachments.len > 0) {
+        clear_color = desc.color_attachments[0].clear_color;
+    }
+
+    self.command_list.*.lpVtbl.*.ClearRenderTargetView.?(self.command_list, rtv_handle, &clear_color, 0, null);
+    self.command_list.*.lpVtbl.*.RSSetViewports.?(self.command_list, 1, &self.viewport);
+    self.command_list.*.lpVtbl.*.RSSetScissorRects.?(self.command_list, 1, &self.scissor_rect);
+
+    const dx12_render_pass = try self.allocator.create(DX12RenderPass);
+    dx12_render_pass.* = DX12RenderPass{
+        .allocator = self.allocator,
+        .command_list = self.command_list,
+        .renderer = self,
+    };
+
+    const render_pass = try self.allocator.create(renderer.RenderPass);
+    render_pass.* = renderer.RenderPass{
+        .handle = dx12_render_pass,
+        .vtable = &dx12_render_pass_vtable,
+    };
+
+    return render_pass;
 }
 
 fn presentImpl(ptr: *anyopaque) anyerror!void {

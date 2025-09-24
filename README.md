@@ -30,6 +30,14 @@
 
 </div>
 
+## DISCLAIMER
+
+⚠️ **EXPERIMENTAL LIBRARY - FOR LAB/PERSONAL USE** ⚠️
+
+This is an experimental library under active development. It is
+intended for research, learning, and personal projects. The API is subject
+to change!
+
 ---
 
 Kline is a powerful cross-platform rendering engine built in Zig, providing hardware-accelerated 3D/4D rendering with multiple backends and comprehensive graphics capabilities.
